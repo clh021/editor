@@ -12,6 +12,7 @@ home=$currentPath/$filename/
 if ! test -f "$conf"; then
 	mkdir -p "$( dirname "$conf" )"
 	git clone --depth=1 $projUrl "$(dirname "$conf")"
+	echo HOME=$home ./doomemacs/.emacs.d/bin/doom install
 	HOME=$home ./doomemacs/.emacs.d/bin/doom install
 fi
 
