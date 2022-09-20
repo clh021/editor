@@ -9,7 +9,7 @@ set -e
 cd "$( dirname "${BASH_SOURCE[0]}" )"
 currentPath="$(pwd)"
 filenameExt="$(basename "$0")"
-filename="${filenameExt%%.*}"
+filename="${filenameExt%.*}"
 conf=$currentPath/$filename/.SpaceVim/init.el
 export HOME=$currentPath/$filename/
 
