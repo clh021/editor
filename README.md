@@ -9,6 +9,9 @@
 
 # 学习资料
 - [vim从入门到精通.中文版](https://github.com/wsdjeg/vim-galore-zh_cn)
+- https://github.com/rockerBOO/awesome-neovim
+- https://github.com/skywind3000/awesome-cheatsheets
+- https://github.com/topics/vim
 
 ## vscode(vspaceCode v0.10.9) v1.69.0
 ### 评估
@@ -18,6 +21,8 @@
 手速快时会有卡顿的情况
 
 ## spacemacs v[DEV.20220831]
+- https://github.com/clh021/spacemacs-private
+- https://github.com/syl20bnr/spacemacs
 ### 评估
 能够使用
 ### 缺点
@@ -29,3 +34,8 @@
 ## spacevim v
 
 ## LunarVim v
+- https://github.com/LunarVim/LunarVim
+- https://github.com/LunarVim/Neovim-from-scratch
+
+## NvChad v
+- https://github.com/NvChad/NvChad
