@@ -5,15 +5,13 @@
 #   - git
 #   - curl
 #
-set -ex
+set -e
 cd "$( dirname "${BASH_SOURCE[0]}" )"
 currentPath="$(pwd)"
 filenameExt="$(basename "$0")"
 filename="${filenameExt%.*}"
-conf=$currentPath/$filename/.SpaceVim/init.vim
+conf=$currentPath/$filename/.config/nvim/init.lua
 export HOME=$currentPath/$filename/
-echo $HOME
-exit
 
 if ! test -f "$conf"; then
   git clone --depth=1 https://github.com/LunarVim/nvim-basic-ide.git "$HOME/.config/nvim"
@@ -21,7 +19,6 @@ if ! test -f "$conf"; then
   # curl -sLf https://raw.fastgit.org/LunarVim/LunarVim/master/utils/installer/install.sh | bash
   # bash <(curl -s https://raw.fastgit.org/lunarvim/lunarvim/master/utils/installer/install.sh)
 fi
-exit
 
 # 优先启用 neovim, 其次是 vim
 VimBin=
