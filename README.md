@@ -7,6 +7,13 @@
 # 需求
 - 尽量使用 vim 快捷键,使一个肌肉记忆随处可用,如切换到其他机器上使用时，或者切换到其他编辑器时可配上vim模式插件
 
+# 想法
+- emacs 可以煮咖啡并不是它的优点，起码完全沉浸之前不是，另外术业有专攻
+- vim 好像star项目不如emacs但是使用人数一定更多，生态比emacs更稳定
+- 使用 emacs 的人似乎更乐于分享
+- 学习 vim 比学习 emacs 难在上手
+- 学习 emacs 比 vim 难在深入
+
 # 学习资料
 - [vim从入门到精通.中文版](https://github.com/wsdjeg/vim-galore-zh_cn)
 - https://github.com/rockerBOO/awesome-neovim
