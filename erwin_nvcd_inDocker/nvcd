@@ -1,0 +1,938 @@
+#!/bin/bash -e
+# vim: noai:noet:ts=2:sw=2:colorcolumn=80
+
+# shellcheck disable=SC2155
+#DEBUG=1
+SCRIPT_DIR="$(dirname "$(readlink -f -- "$0")")"
+ARGV=("$@")
+NVCD_ARGS=("--cleanbuild" "--build" "--config" "--update" "--install"
+					 "--kill" "--killall" "--shell" "--help")
+
+function check_depends() {
+	for app in $* ; do
+		if ! command -v "${app}" &>/dev/null; then
+			not_available+=("${app}")
+		fi
+	done
+
+	if (( ${#not_available[@]} > 0)); then
+		err="Please first install missing dependencies:\n"
+		for app in ${not_available[@]} ; do
+			err+="- '${app}'\n"
+		done
+		err+="\n"
+		msg_error "${err}"
+	fi
+}
+
+function check_environment() {
+	if [ -n "$SSH_CONNECTION" ]; then
+		echo " Connected via SSH "
+	elif [ "$XDG_SESSION_TYPE" == "tty" ]; then
+		echo " Connected on console "
+	fi
+}
+
+function config_script_standard() {
+	mkdir -p "$SCRIPT_DIR/share"/{swap,undo}
+	:;
+}
+
+function config_script() {
+	if [ ! -d "$SCRIPT_DIR/custom" ]; then
+		mkdir "$SCRIPT_DIR/custom"
+		for example in "${SCRIPT_DIR}/NvConfig/examples/"/*; do
+			cp "$example" "$SCRIPT_DIR/custom"
+		done
+	fi
+	if [ ! -d "$SCRIPT_DIR/NvConfig/lua/custom" ]; then
+		echo ln -sr "$SCRIPT_DIR/custom" "$SCRIPT_DIR/NvConfig/lua/custom"
+		ln -sr "$SCRIPT_DIR/custom" "$SCRIPT_DIR/NvConfig/lua/custom"
+	fi
+}
+
+function clean_script_standard() {
+	if [ -d "$SCRIPT_DIR/share" ]; then
+		find "$SCRIPT_DIR/share" -type f \
+			! -wholename "$SCRIPT_DIR/share/undo/*" \
+			! -wholename "$SCRIPT_DIR/share/swap/*" \
+			-exec rm -f {} +
+		find "$SCRIPT_DIR/share" -empty -type d -delete
+	fi
+
+	rm -fvR "$SCRIPT_DIR/cache"
+
+	if [ -d "$SCRIPT_DIR/NvConfig" ]; then
+		if [ -z "$(git -C "$SCRIPT_DIR/NvConfig" status --porcelain)" ]; then
+			rm -fvR "$SCRIPT_DIR/NvConfig"
+		else
+			cd "$SCRIPT_DIR/NvConfig"
+			git status
+			msg_error "NvConfig has local changes - Please copy somewhere \n\n"
+		fi
+	fi
+}
+
+function clean_script() {
+	:;
+}
+
+function delete_broken_symlinks() {
+	cd "${SCRIPT_DIR}"
+	# Delete Symlinks Pointing Inside
+	for file in ./*; do
+	  if [ -L "$file" ]; then
+		  if [ -h "$file" -a ! -e "$file" ]; then
+		  	echo "rm $file"
+		  	rm -v "$file"
+		  else
+		    echo "Ignoring: $file"
+		  fi
+	  fi
+	done
+}
+
+function time_ago() {
+    local now_unix="$(date +'%s')"
+    local SEC_PER_MINUTE=$((60))
+    local   SEC_PER_HOUR=$((60*60))
+    local    SEC_PER_DAY=$((60*60*24))
+    local  SEC_PER_MONTH=$((60*60*24*30))
+    local   SEC_PER_YEAR=$((60*60*24*365))
+
+
+    #local last_unix="$(date --date="$1" +%s)"    # convert date to unix timestamp
+	if [[ "$1" =~ ^\-(.*) ]]; then
+		local delta_s="${BASH_REMATCH[1]}"
+		local suffix="ago"
+	elif [[ "$1" =~ ^\+(.*) ]]; then
+		local delta_s="${BASH_REMATCH[1]}"
+		local suffix="later"
+	else
+		if [[ "$1" -gt $now_unix ]]; then
+			local suffix="later"
+			local delta_s=$(( $1 - $now_unix ))
+		else
+			local suffix="ago"
+			local delta_s=$(( $now_unix - $1 ))
+		fi
+	fi
+
+    if (( delta_s <  SEC_PER_MINUTE * 2)); then
+		echo $((delta_s))" seconds $suffix"
+    elif (( delta_s <  SEC_PER_HOUR * 2)); then
+        echo $((delta_s / SEC_PER_MINUTE))" minutes $suffix"
+    elif (( delta_s <  SEC_PER_DAY * 2)); then
+        echo $((delta_s / SEC_PER_HOUR))" hours $suffix"
+    elif (( delta_s <  SEC_PER_MONTH * 2)); then
+        echo $((delta_s / SEC_PER_DAY))" days ago"
+    elif (( delta_s <  SEC_PER_YEAR * 2)); then
+        echo $((delta_s / SEC_PER_MONTH))" months $suffix"
+    else
+        echo $((delta_s / SEC_PER_YEAR))" years $suffix"
+    fi
+}
+
+function yes_prompt() {
+	retval=""
+	printf "$*"
+	while [[ ! "$retval" =~ ^y|n$ ]]; do
+		printf "\ty|n "
+		read -n 1 -r retval
+		printf "\n"
+	done
+}
+
+function clear_screen() {
+	printf "\033c" # clear screen
+}
+
+print_center(){
+	local x
+	local y
+	text="$*"
+	x=$(( ($(tput cols) - ${#text}) / 2))
+	echo -ne "\E[6n";read -sdR y; y=$(echo -ne "${y#*[}" | cut -d';' -f1)
+	echo -ne "\033[${y};${x}f$*"
+}
+
+
+function print_usage() {
+	cat <<EOF
+	$PROGNAME:	NeoVim nvChad in Docker
+
+		 Easy wrapper around Docker permissions gauntlet
+		 to run one or more neovim configs
+		 Auto downloadd the nvChad config
+
+		 Just set DOCKER_IMAGE="other-name" if you don't
+		 want configs to have their own docker image
+		 See: https://github.com/erwin/nvcd/
+
+	--help:     This help/usage message
+	            Use '-h' to access neovim help
+
+	--build:	Builds the neovim Docker image (latest stable release)
+		+ NvChad config (head from github)
+
+	--cleanbuild:   Build but skips using the cache
+		 run docker build --no-cache
+
+	--update:   Neovim binary and config template
+
+  --mirror:  Locate the fastest public mirror
+
+	--shell:   Launch a shell inside the container
+		 Useful for troubleshooting/customizing Dockerfile
+	
+	--config:  Shows exactly show the configuration will run for your system
+
+	--kill:    Stop any instances of the related docker process
+
+	--install: Create symlinks in your \$PATH
+	         If run as root, symlinks in /usr/local/bin
+	
+EOF
+}
+
+function check_braille() {
+	clear_screen
+	cat <<EOF
+	╔════════════════════╗   ⣿⠛⠛⠛⠛⠛⠛⠛⠛⠛⠛⠛⠛⠛⠛⠛⠛⠛⠛⠛⠛⣿
+	║                    ║   ⣿                    ⣿ 
+	║   ╭────────────╮   ║   ⣿   ⡏⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⢸   ⣿ 
+	║   │ left boxes │   ║   ⣿   ⡇ right boxes⢸   ⣿ 
+	║   ╰────────────╯   ║   ⣿   ⠓⠒⠒⠒⠒⠒⠒⠒⠒⠒⠒⠒⠒⠚   ⣿ 
+	╚════════════════════╝   ⠛⠛⠛⠛⠛⠛⠛⠛⠛⠛⠛⠛⠛⠛⠛⠛⠛⠛⠛⠛⠛⠛
+EOF
+
+	yes_prompt "\tCan you see boxes on the left and boxes on the right?\n\n"
+	if [ "$retval" != 'y' ]; then
+		yes_prompt "\tDo you want to install the Symbola braille font?\n\tBraille fonts also make 'gotop' look awesome!\n\n"
+		if [ "$retval" == 'y' ]; then
+			fonts_dir="${HOME}/.local/share/fonts"
+			# Check the current URL via 
+			# https://aur.archlinux.org/cgit/aur.git/tree/PKGBUILD?h=font-symbola
+			# Symbola is for Braile Fonts
+			if [ ! -f "$fonts_dir/Symbola.otf" ]; then
+				if [ ! -f "Symbola.zip" ]; then
+					curl -LS "https://dn-works.com/wp-content/uploads/2020/UFAS-Fonts/Symbola.zip" --output "Symbola.zip"
+				fi
+				unzip -jqo "Symbola.zip" Symbola.otf -d "${fonts_dir}"
+			fi
+			msg_green "\nPlease restart your terminal to activate the new font\n\n\n"
+			exit 1
+		fi
+	fi
+}
+
+function check_font() {
+	clear_screen
+	cat <<EOF
+⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿
+⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿
+⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠿⢿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠿⢿⣿⣿⣿⣿⣿⣿⣿
+⣿⠛⠛⠛⠛⠛⠛⠛⠛⢻⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠟⠁⠀⢀⣽⣿⣿⣿⣿⣿⣿⣿⡉⠉⠉⢉⣿⣿⠉⠉⠉⣹⣿⣿⣿⣿⣿⣅⠀⠀⠙⢿⣿⣿⣿⣿⣿
+⣿⠀⠰⣦⡀⠀⠀⠀⠀⢸⣿⣿⣿⣿⣿⣿⣿⡿⠿⠿⠿⠿⠿⠿⠿⠿⠧⠙⢿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠟⠁⠀⢀⣴⣿⣿⣿⣿⣿⣿⣿⣿⣿⡇⠀⠀⢸⠟⠁⠀⣠⣾⣿⣿⣿⣿⣿⣿⣿⣷⣄⠀⠀⠙⢿⣿⣿⣿
+⣿⠀⢠⠞⢁⣀⣀⠀⠀⢸⣿⣿⣿⣿⣿⣿⣿⣷⣶⣶⣶⣶⣶⣶⣶⣶⣶⣶⡦⢙⣿⣿⣿⣿⣿⣿⣿⣿⣿⣇⠀⠀⠐⢿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡇⠀⠀⠀⠀⣠⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠇⠀⠀⢀⣿⣿⣿
+⣿⠀⠀⠀⠀⠀⠀⠀⠀⢸⣿⣿⣿⣿⣿⣿⣿⣧⣤⣤⣤⣤⣤⣤⣤⣤⡤⢀⣴⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣷⣄⠀⠀⠙⢿⣿⣿⣿⣿⣿⣿⣿⣿⡇⠀⠀⣠⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠟⠁⠀⢀⣴⣿⣿⣿⣿
+⣿⣶⣶⣶⣶⣶⣶⣶⣶⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣷⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣷⣄⠀⢀⣽⣿⣿⣿⣿⣿⣿⣿⣧⣤⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣅⠀⢀⣴⣿⣿⣿⣿⣿⣿
+⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿
+⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿
+⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿
+EOF
+
+printf "\u001b[48;2;111;143;175m  "
+#printf "\u001b[48;2;111;143;175m  "
+printf "\u001b(B\u001b[m\u001b[38;2;111;143;175m\u001b[48;2;72;75;76m "
+printf "\u001b(B\u001b[m\u001b[38;2;72;75;76m\u001b[48;2;45;48;49m "
+printf "\u001b(B\u001b[m\u001b[38;2;199;184;157m\u001b[48;2;45;48;49m                                                                 "
+printf "\u001b(B\u001b[m\u001b[38;2;45;48;49m\u001b[48;2;34;37;38m "
+printf "\u001b(B\u001b[m\u001b[38;2;236;107;100m\u001b[48;2;34;37;38m"
+printf "\u001b(B\u001b[m\u001b[38;2;40;43;44m\u001b[48;2;236;107;100m \033[m\n\n"
+
+#printf "\t\ue7c5 NORMAL\ue0bc \ue0bc  \uf719 Empty \ue0bc \ue0b6\ue612  Bot\n\n"
+
+yes_prompt "\tDoes the font below look like the braille image above;\n\tand does the status bar below the image look correct?\n\n                                  \ue795 => \uf053 \ue62b \uf054 \n\n"
+#printf '      \ue795 => \uf053 \ue62b \uf054 \n\n'
+#printf ' Other Useful Chracters: \ue7c5 \uf74a \ue612 \n\n'
+#printf '      y|n '
+#read -n 1 -r font_test
+
+if [ "$retval" != 'y' ]; then
+	yes_prompt "\tDo you want to install a patched icon (nerd) font now?\n\n"
+	if [ "$retval" == 'y' ]; then
+		install_nerdfont
+		check_font
+	fi
+	cat <<EOF
+*******************************************************************************
+* ICONS
+*******************************************************************************
+These icons need a "Nerd Font" patched font. Download one at:
+
+	https://www.nerdfonts.com/font-downloads
+
+Extract into ~/.local/share/fonts
+
+Inside of each font package they've included ~20 different font files.
+You only need the "* Nerd Font Complete Mono Windows Compatible" files.
+
+For licensing reasons, many names are intentionally duplicated:
+
+	"Fira" -> "F*u*ra"
+	"Hermit" -> "H*u*rmit"
+	"Liberation" -> "Li*t*eration"
+	"Source Code" -> "S*a*uce Code"
+
+You can install whichever version you like, but no reason to install both.
+
+*******************************************************************************
+* BRAILE FONTS
+*******************************************************************************
+On Fedora 32 run:
+  sudo dnf install kitty gdouros-symbola-fonts
+In ~/.config/kitty/kitty.conf add:
+  symbol_map U+2800-U+28FF Symbola
+
+Install a font like ttf-symbola and 
+if you have gnu-free-fonts installed, remove it
+
+*******************************************************************************
+* LIGATURES
+*******************************************************************************
+Combining the '=' with the '>' to get one symbol uses a Unicode Ligature.
+The best terminal I know of for ligature support is kitty.
+Common l
+
+	https://erwin.co/kitty-and-nerd-fonts/
+
+If you dont like ligatures, you may perfer alacritty, as the developers
+of alacritty have rejected ligature support:
+
+	https://github.com/alacritty/alacritty/issues/50
+
+EOF
+  msg_error "Please figure out icon fonts before continuing\n\n"
+
+
+fi
+
+}
+
+function install_nerdfont() {
+	check_depends unzip curl
+	# Idea from https://gist.github.com/matthewjberger/7dd7e079f282f8138a9dc3b045ebefa0
+	fonts_dir="${HOME}/.local/share/fonts"
+	version='2.1.0'
+	fonts=(Agave CascadiaCode IBMPlexMono Cousine DaddyTimeMono 
+			DejaVuSansMono DroidSansMono FantasqueSansMono FiraCode Hack
+		   	Hermit Inconsolata JetBrainsMono Lekton LiberationMono Monofur
+		   	Monoid Mononoki RobotoMono ShareTechMono SourceCodePro SpaceMono
+		   	UbuntuMono VictorMono)
+
+	if [[ ! -d "$fonts_dir" ]]; then
+		mkdir -p "$fonts_dir"
+	fi
+
+	fuzzy_finder "${fonts[@]}"
+	if [ -n "$retval" ]; then
+		download_url="https://github.com/ryanoasis/nerd-fonts/releases/download/v${version}/${retval}.zip"
+		if [ ! -f "${SCRIPT_DIR}/${retval}.zip" ]; then
+			curl -LS "$download_url" --output "${SCRIPT_DIR}/${retval}.zip"
+		fi
+		# See: https://stackoverflow.com/questions/908679/unzip-specific-extension-only
+		#unzip -d "${fonts_dir}" -jqo "${retval}.zip" "*Nerd Font Complete*.otf"
+		unzip -jqo "${SCRIPT_DIR}/${retval}.zip" -d "${SCRIPT_DIR}/${retval}"
+		find "${SCRIPT_DIR}/${retval}" \( -iname "*Windows Compatible*" -o -iname "*Complete Mono*" \) -delete
+		cp "${SCRIPT_DIR}/${retval}"/* "${fonts_dir}"
+		fc-cache -f
+		msg_green "\nPlease change your terminal settings to activate ${retval}, new font\n\n\n"
+		exit 1
+	fi
+}
+
+# void-linux/xbps mirrors are all synced within 24-hours of the master
+# See: https://grafana.s.voidlinux.org/d/cLraC-XMk/mirrors-status
+function check_mirror() {
+	if [ -f "$SCRIPT_DIR/.mirror" ]; then
+		MIRROR_URL=$(<"$SCRIPT_DIR/.mirror")
+	else
+		index="current/x86_64-repodata"
+		urls=()
+		locs=()
+		speeds=()
+		connects=()
+
+		if [ ! -f "$SCRIPT_DIR/.urls" ]; then
+			echo "Getting list of Mirrors from Github"
+			curl_out=$(curl --url "https://github.com/void-linux/void-docs/raw/master/src/xbps/repositories/mirrors/index.md" \
+									--location --progress-bar)
+			while [[ $curl_out =~ \<(https?://[^\>]+)\>[[:space:]]*$'|'[[:space:]]*([^$'|']*)[[:space:]]*$'|' ]]; do
+				curl_out=${curl_out#*${BASH_REMATCH[0]}};
+				urls+=("${BASH_REMATCH[1]}")
+				locs+=("${BASH_REMATCH[2]}")
+			done
+
+			for ((idx=0; idx<${#urls[@]}; ++idx)); do
+				echo "$(( $idx + 1 )) of ${#urls[@]}: ${urls[idx]} => ${locs[idx]}"
+				set +e
+				curl_out=$(curl --url "${urls[idx]}/$index" \
+										--no-show-error \
+										--connect-timeout 1 --max-time 4 --progress-bar \
+										--write-out "%{time_appconnect}\t%{speed_download}" \
+										--output /dev/null)
+				#						--speed-limit $(( 1024 * 1024 )) \
+				set -e
+				if [ $? -eq 0 ]; then
+					connects[$idx]="${curl_out%$'\t'*}"
+					speeds[$idx]="${curl_out#*$'\t'}"
+				fi
+			done
+			# TODO: improve basic caching in case we have an error with the 
+			#       sorting or selection of speed/mirror values
+			printf "%s\n" "${urls[@]}" > "$SCRIPT_DIR/.urls"
+			printf "%s\n" "${locs[@]}" > "$SCRIPT_DIR/.locs"
+			printf "%s\n" "${speeds[@]}" > "$SCRIPT_DIR/.speeds"
+			printf "%s\n" "${connects[@]}" > "$SCRIPT_DIR/.connects"
+		else 
+			readarray -t urls <"$SCRIPT_DIR/.urls"
+			readarray -t locs <"$SCRIPT_DIR/.locs"
+			readarray -t speeds <"$SCRIPT_DIR/.speeds"
+			readarray -t connects <"$SCRIPT_DIR/.connects"
+		fi
+
+		readarray -t speed_sorted_idx < <(echo "${speeds[@]}" | tr ' ' '\n' | cat --number | sort --numeric-sort --reverse --key=+2 | cut -f1)
+
+		for ((idx=0; idx<${#speed_sorted_idx[@]}; ++idx)); do
+			spd_idx=$(( ${speed_sorted_idx[$idx]} - 1))
+			choose_mirror+=("$( printf "%2d" $(( $idx + 1 )) ):	$( printf "%8d" ${speeds[$spd_idx]} )	${locs[$spd_idx]}	# ${urls[$spd_idx]}")
+		done
+
+		if [ ${#choose_mirror[@]} -gt 1 ]; then
+			tabs 5,15,35,45
+			fuzzy_finder "${choose_mirror[@]}"
+			if [[ $? -eq 0 && -n "$retval" ]]; then
+				MIRROR_URL="${retval##*#}/current/"
+				echo $MIRROR_URL > "$SCRIPT_DIR/.mirror"
+			fi
+			tabs -8
+		fi
+	fi
+}
+
+function initialize() {
+  # Make sure all required dependencies are available
+  # git command not found
+  # docker command not found
+  # run DOCKER_SOCKET permissions check
+  if [ ! -f "$SCRIPT_DIR/.ready" ]; then
+    set +e
+    docker --version || msg_error "Docker must be installed\n\n"
+    git --version    || msg_error "Git must be installed\n\n"
+		xauth -V         || msg_error "xauth must be installed\n\n"
+    check_docker
+		check_braille
+    check_font
+    set -e
+    touch "$SCRIPT_DIR/.ready"
+  fi
+	check_mirror
+}
+
+function get_config() {
+	PROGNAME="${0##*/}"
+	SCRIPT_PATH=$(readlink -f -- "$0")
+	CWD=$(pwd)
+	if [ -f "$SCRIPT_DIR/config" ]; then
+		# shellcheck disable=SC1091
+		source "$SCRIPT_DIR/config"
+	fi
+	DOCKER_TAG=${docker_tag:-'nvcd'}
+	DOCKER_SOCKET=${docker_socket:-'/var/run/docker.sock'}
+	EXTRA_PACKAGES=${extra_packages:-''}
+	CONFIG_TEMPLATE=${config_template:-'https://github.com/NvChad/NvChad'}
+	USER_NAME=${user_name:-$(id -u -n)}
+	USER_ID=${user_id:-$(id -u)}
+	GROUP_ID=${group_id:-$(id -g)}
+	GROUP_NAME=${group_name:-$(id -g -n)}
+	USER_SHELL=${user_shell:-$(basename "$SHELL")}
+	set +e # in case git is not configured
+	GIT_USER_NAME=${git_user_name:-$(git config --global user.name)}
+	GIT_USER_EMAIL=${git_user_email:-$(git config --global user.email)}
+	set -e
+
+	DOCKER_UPDATE_SECONDS=${docker_update_seconds:-'86400'}
+	GIT_UPDATE_SECONDS=${git_update_seconds:-'86400'}
+	if [ -f "$SCRIPT_DIR/.ready" ]; then
+		DOCKER_LAST_UPDATE=$(date -r "$SCRIPT_DIR/.ready" +"%s")
+	fi
+	if [ -f "$SCRIPT_DIR/.nvconfig.pull" ]; then
+		GIT_LAST_UPDATE=$(date -r "$SCRIPT_DIR/.nvconfig.pull" +"%s")
+	fi
+}
+
+function check_installed() {
+	if command -v "$PROGNAME" &> /dev/null; then
+		INSTALL_PATH=$(which "$PROGNAME")
+		INSTALL_MSG="Installed in: $INSTALL_PATH ($PROGNAME)"
+		#if command -v whereis &> /dev/null; then
+		#	INSTALL_MSG=$INSTALL_MSG 
+		#fi
+	else
+		INSTALL_MSG=$(msg_red "Not Installed. Use: $PROGNAME --install")
+	fi
+}
+
+function check_docker() {
+	if [ -S "$DOCKER_SOCKET" ]; then
+		if [ -w "$DOCKER_SOCKET" ]; then
+			DOCKER_MSG="Docker Socket $DOCKER_SOCKET exists and writable by $USER_NAME"
+		else
+			msg_error "User $USER_NAME (UID $USER_ID) can't write to $DOCKER_SOCKET\nPerhaps try:\n\tsudo usermod -a -G docker $USER_NAME\nThen log out and log in again\nOr use: 'exec newgrp docker' to apply only to current shell\n\n"
+		fi
+	else
+		msg_error "Docker Socket: $DOCKER_SOCKET - Doesnt exist or not accessible. Is Dockerd running?\n\n"
+	fi
+}
+
+function print_config() {
+	check_installed && echo "$INSTALL_MSG"
+	check_docker && echo "$DOCKER_MSG"
+	echo "Path Used to Lauch Script: $0"
+	echo "Name Used to Launch Script: $PROGNAME"
+	echo
+	echo "Config Template: ${CONFIG_TEMPLATE##*/}"
+	echo "Git URL: ${CONFIG_TEMPLATE}"
+	echo
+	echo "Path to Script: $SCRIPT_DIR"
+	echo "User:  $USER_NAME (ID: $USER_ID)"
+	echo "Group: $GROUP_NAME (ID: $GROUP_ID)"
+	echo "Shell: $USER_SHELL"
+	echo "Git Name: $GIT_USER_NAME"
+	echo "Git Email: $GIT_USER_EMAIL"
+	echo
+	echo "Extra Packages: $EXTRA_PACKAGES"
+	echo "Docket Socket: $DOCKER_SOCKET"
+	echo "Name of Docker Tag: $DOCKER_TAG"
+	echo 
+	echo "Docker Update Seconds: ${DOCKER_UPDATE_SECONDS} sec == $(time_ago "+$DOCKER_UPDATE_SECONDS")"
+	echo "Git Update Seconds:    ${GIT_UPDATE_SECONDS} sec == $(time_ago "+$GIT_UPDATE_SECONDS")"
+	echo "Last Update:    Docker ($(time_ago $DOCKER_LAST_UPDATE)) Git ($(time_ago $GIT_LAST_UPDATE))"
+	echo "Next Update:    Docker ($(time_ago $(( $DOCKER_LAST_UPDATE + $DOCKER_UPDATE_SECONDS )) ))   Git ($(time_ago $(( $GIT_LAST_UPDATE + $GIT_UPDATE_SECONDS )) ))"
+	echo
+	docker image ls "$DOCKER_TAG"
+}
+
+function fuzzy_finder() {
+	items=("$@")
+	if command -v sk &> /dev/null; then
+		retval=$(printf "%s\n" "${items[@]}" | sk)
+	elif command -v fzy &> /dev/null; then
+		retval=$(printf "%s\n" "${items[@]}" | fzy)
+	elif command -v fzf &> /dev/null; then
+		retval=$(printf "%s\n" "${items[@]}" | fzf)
+	else
+		for each in "${items[@]}"; do
+			echo "$each"
+		done
+		read retval
+	fi
+}
+
+function msg_red() {
+    # error messages in bold/red
+    [ -n "$NOCOLORS" ] || printf >&2 "\033[1m\033[31m"
+    printf >&2 "ERROR: $@"
+    [ -n "$NOCOLORS" ] || printf >&2 "\033[m"
+}
+
+function msg_green() {
+    [ -n "$NOCOLORS" ] || printf >&2 "\033[1m\033[32m"
+    printf >&2 "$@"
+    [ -n "$NOCOLORS" ] || printf >&2 "\033[m"
+}
+
+function msg_blue() {
+    [ -n "$NOCOLORS" ] || printf >&2 "\033[1m\033[34m"
+    printf >&2 "$@"
+    [ -n "$NOCOLORS" ] || printf >&2 "\033[m"
+}
+
+function msg_error() {
+    msg_red "$@" && exit 1
+}
+
+function get_install_path() {
+	if [ $UID -eq 0 ]; then
+		retval="/usr/local/bin"
+	else
+		OLD_IFS=${IFS}
+		IFS=":"
+		install_paths=()
+		for dir in ${PATH}; do
+			if [ -w "$dir" ]; then
+				set +e
+				if [ ! $(git -c "$dir" rev-parse 2>/dev/null) = 0  ]; then
+					install_paths+=("$dir")
+				fi
+				set -e
+			fi
+		done
+
+		if [ ${#install_paths[@]} -eq 0 ]; then
+			msg_red "All user writable components of your \$PATH are git repos\n\n"
+			for dir in ${PATH}; do
+				if [ -w "$dir" ]; then
+					install_paths+=("$dir")
+				fi
+			done
+		fi
+		if [ ${#install_paths[@]} -eq 0 ]; then
+			msg_error "No user writable directories are in path. Install with root or update environment\n\n"
+		fi
+
+		IFS=${OLD_IFS}
+		fuzzy_finder "${install_paths[@]}"
+	fi
+
+	if [ ! -d $retval ]; then
+		msg_error "Invalid Install Path: $retval\n\n "
+	fi
+}
+
+function do_install() {
+	get_install_path
+	ln -sf "$SCRIPT_PATH" $retval
+}
+
+function fix_args() {
+	o_args=()
+	for arg in "${ARGV[@]}"; do
+		# shellcheck disable=SC2076,SC2199
+		if [[ ! " ${NVCD_ARGS[@]} " =~ " $arg " ]]; then
+			if [[ -n "$skip_next" ]]; then
+				o_args+=( "$arg" )
+				skip_next=""
+			elif [[ -z "$force" && "$arg" =~ ^\+|^\- ]]; then
+				# after we find '--' force everything to be a filename
+				if [[ "$arg" == "--" ]]; then
+					force=1
+				# for commands, don't try to parse it as a filename
+				elif [[ "$arg" == '-c' || "$arg" == '--cmd' ]]; then
+					skip_next=1
+				fi
+				# pass through any args starting with '-' or '+' to neovim
+				o_args+=( "$arg" )
+			else
+				# arg should be an actual filename
+				abs_arg=$(readlink -f -- "$arg")
+				[[ -n $DEBUG ]] && echo "($arg) => ($abs_arg)"
+				
+				if [[ -L "$arg" ]]; then
+					[[ -n $DEBUG ]] && echo "SYMLINK TO: '/mnt${abs_arg}'"
+					o_args+=( "/mnt${abs_arg}" )
+				elif [[ "$arg" =~ ^/.* ]]; then
+					[[ -n $DEBUG ]] && echo "ABS: '/mnt${arg}'"
+					o_args+=( "/mnt${abs_arg}" )
+				elif [[ "$arg" =~ ^../ ]]; then
+					[[ -n $DEBUG ]] && echo "REL PARENT: '$arg'"
+					o_args+=( "/mnt${abs_arg}" )
+				elif [[ "$arg" =~ /../ ]]; then
+					[[ -n $DEBUG ]] && echo "REL COMPLEX: '$arg'"
+					o_args+=( "/mnt${abs_arg}" )
+				else
+					[[ -n $DEBUG ]] && echo "REL: '$arg'"
+					o_args+=( "$arg" )
+				fi
+			fi
+		fi
+	done
+}
+
+function choose_container() {
+	choose_container=()
+	for container in $(docker ps -q --filter ancestor="$DOCKER_TAG"); do
+		ARGS=$(docker inspect "$container" -f "{{ .Args }}")
+		STARTED=$(docker inspect "$container" -f "{{ .State.StartedAt }}")
+		# local last_unix="$(date --date="$1" +%s)"    # convert date to unix timestamp
+		WHEN=$(time_ago $(date --date="$STARTED" +%s))
+		choose_container+=("$ARGS	$WHEN	/// $container")
+	done
+	if [ ${#choose_container[@]} -gt 1 ]; then
+		tabs 1,45,70
+		fuzzy_finder "${choose_container[@]}"
+		tabs -8
+	else
+		retval=${choose_container[0]}
+	fi
+}
+
+function do_shell() {
+	check_depends tabs
+	if [ -n "$(docker ps -q --filter ancestor="$DOCKER_TAG")" ]; then
+		choose_container
+		exec docker exec -it ${retval##*/} "$USER_SHELL"
+	else 
+		ENTRYPOINT="--entrypoint $USER_SHELL "
+		do_run
+	fi
+}
+
+function do_kill() {
+	if [ -n "$(docker ps -q --filter ancestor="$DOCKER_TAG")" ]; then
+		choose_container
+		exec docker kill ${retval##*/}
+	fi
+}
+
+function do_killall() {
+	if [ -n "$(docker ps -q --filter ancestor="$DOCKER_TAG")" ]; then
+		for process in $(docker ps -a -q --filter ancestor="$DOCKER_TAG"); do
+			docker kill "$process"
+		done
+	fi
+}
+
+
+function do_run() {
+	if [ ! -d "$SCRIPT_DIR/NvConfig" ]; then
+		do_build
+	fi
+	fix_args
+	#  --detach-keys "ctrl-z" \
+	# TODO: possible to block CTRL+Z? Right now CTRL+Z hangs
+	#   --sig-proxy=true -- no impact\
+	# TODO: force creation of /tmp/nvimsocket 
+	#       (/tmp/nvimsocket1 socketN for additional instances)
+	RM_IT="--rm"
+	
+	if [[ -t 0 ]]; then RM_IT="$RM_IT -i"; fi
+	if [[ -t 1 ]]; then RM_IT="$RM_IT -t"; fi
+
+	if [[ -n "$LC_ALL" ]];   then LOCALE+=" -e LC_ALL "; fi
+	if [[ -n "$LC_CTYPE" ]]; then LOCALE+=" -e LC_CTYPE "; fi
+	if [[ -n "$LANG" ]];     then LOCALE+=" -e LANG "; fi
+
+	if [ "$XDG_SESSION_TYPE" == "x11" ]; then
+		XAUTH=$(mktemp -t "${DOCKER_TAG}.xauth.XXXX")
+		xauth nlist $DISPLAY | sed -e 's/^..../ffff/' | xauth -f $XAUTH nmerge -
+		WINDOW_MANAGER+="-v /tmp/.X11-unix:/tmp/.X11-unix:rw "
+		WINDOW_MANAGER+="-v $XAUTH:$XAUTH:rw "
+		WINDOW_MANAGER+="-e QT_X11_NO_MITSHM=1 "
+		WINDOW_MANAGER+="-e DISPLAY "
+		WINDOW_MANAGER+="-e XAUTHORITY=/mnt/home/${USER_NAME}/${XAUTHORITY##*/} "
+	elif [ "$XDG_SESSION_TYPE" == "wayland" ]; then
+		WINDOW_MANAGER+="-e WAYLAND_DISPLAY "
+		WINDOW_MANAGER+="-e XDG_RUNTIME_DIR "
+		WINDOW_MANAGER+="-v $XDG_RUNTIME_DIR:$XDG_RUNTIME_DIR:rw "
+	elif [ "$XDG_SESSION_TYPE" == "tty" ]; then
+		msg_green "Awesome! Launching in raw TTY\n"
+	elif [ -n "$XDG_SESSION_TYPE" ]; then
+		msg_error "Unknown XDG_SESSION_TYPE: $XDG_SESSION_TYPE\n\n"
+	fi
+
+	# docker run  --add-host=host.docker.internal:host-gateway \
+	#  -v "$SCRIPT_DIR/cache:/home/$USER_NAME/.cache/nvim" \
+
+	# shellcheck disable=SC2086
+	docker run --init $RM_IT $ENTRYPOINT\
+	  --net=host \
+	  --user "$USER_ID":"$GROUP_ID" \
+	  -v "/etc/passwd:/etc/passwd" \
+	  -v "/etc/group:/etc/group" \
+	  -v "$SCRIPT_DIR:/nvcd" \
+	  -v "$SCRIPT_DIR/NvConfig:/home/$USER_NAME/.config/nvim" \
+	  -v "$SCRIPT_DIR/custom:/home/$USER_NAME/.config/custom" \
+	  -v "$SCRIPT_DIR/cache:/home/$USER_NAME/.cache" \
+	  -v "$SCRIPT_DIR/local:/home/$USER_NAME/.local" \
+	  -v "$SCRIPT_DIR/share:/home/$USER_NAME/.local/share/nvim" \
+	  -v "$SCRIPT_DIR/NvConfig:/root/.config/nvim" \
+	  -v "$SCRIPT_DIR/custom:/root/.config/custom" \
+	  -v "${DOCKER_TAG}-home:/home" \
+	  -v "${DOCKER_TAG}-root:/root" \
+	  -v "$CWD:/src" \
+	  -v "/:/mnt" \
+	  -w /src \
+	  $LOCALE \
+	  $WINDOW_MANAGER \
+	  "$DOCKER_TAG" "${o_args[@]}"
+}
+
+function do_clean() {
+	clean_script_standard
+	clean_script
+}
+
+function do_config() {
+	config_script_standard
+	config_script
+}
+
+function do_docker_update() {
+	docker run --init --entrypoint /bin/bash \
+	  --net=host \
+	  --user "$USER_ID":"$GROUP_ID" \
+	  -v "/etc/passwd:/etc/passwd" \
+	  -v "/etc/group:/etc/group" \
+	  -v "$SCRIPT_DIR:/nvcd" \
+	  -v "$CWD:/src" \
+	  -v "/:/mnt" \
+	  -w /src \
+	  "$DOCKER_TAG" /nvcd/update-query
+
+	if [ $? -eq 0 ]; then
+	   touch "$SCRIPT_DIR/.ready"
+	else
+		msg_error "Possible Problem Checking for Update: $0"
+	fi
+}
+
+function do_git_update() {
+	if [ ! -d "$SCRIPT_DIR/NvConfig" ]; then
+		mkdir -p "$SCRIPT_DIR/NvConfig"
+		cd "$SCRIPT_DIR"
+		git clone "$CONFIG_TEMPLATE" NvConfig
+		cd "$CWD"
+	else
+		cd "$SCRIPT_DIR/NvConfig" && git pull
+		cd "$CWD"
+	fi
+	touch "$SCRIPT_DIR/.nvconfig.pull"
+}
+
+
+
+function do_update_check() {
+	if [[ "$(($DOCKER_LAST_UPDATE + $DOCKER_UPDATE_SECONDS))" -lt $EPOCHSECONDS ]]; then
+		do_docker_update
+	fi
+	if [[ $(($GIT_LAST_UPDATE + $GIT_UPDATE_SECONDS)) -lt $EPOCHSECONDS ]]; then
+		do_git_update
+	fi
+}
+
+function do_build() {
+	if [ $UID -eq 0 ]; then
+	    msg_error "Please don't build the image as root\n\n"
+	fi
+	cd "$SCRIPT_DIR"
+	# shellcheck disable=SC2086
+	echo "MIRROR_URL: $MIRROR_URL"
+	docker build \
+		--progress=plain \
+	  $BUILD_ARG \
+	  --build-arg "USER_NAME=${USER_NAME}" \
+	  --build-arg "USER_SHELL=${USER_SHELL}" \
+	  --build-arg "USER_ID=${USER_ID}" \
+	  --build-arg "GROUP_ID=${GROUP_ID}" \
+	  --build-arg "GROUP_NAME=${GROUP_NAME}" \
+	  --build-arg "GIT_USER_NAME=${GIT_USER_NAME}" \
+	  --build-arg "GIT_USER_EMAIL=${GIT_USER_EMAIL}" \
+	  --build-arg "EXTRA_PACKAGES=${EXTRA_PACKAGES}" \
+		--build-arg "MIRROR_URL=${MIRROR_URL}" \
+	  -t "$DOCKER_TAG" .
+
+	if [ $? -ne 0 ]; then
+		msg_error "docker build failed. Try: nvcd --cleanbuild"
+	fi
+
+	cd "$CWD"
+	  touch "$SCRIPT_DIR/.ready"
+
+	mkdir -p "$SCRIPT_DIR/cache" \
+	         "$SCRIPT_DIR/local" \
+	         "$SCRIPT_DIR/share" \
+	         "$SCRIPT_DIR/share"/{swap,undo}
+
+	do_git_update
+
+	# if [ ! -d "$SCRIPT_DIR/NvConfig" ]; then
+	# 	mkdir -p "$SCRIPT_DIR/NvConfig"
+	# 	cd "$SCRIPT_DIR"
+	# 	git clone "$CONFIG_TEMPLATE" NvConfig
+	# 	cd "$CWD"
+	# else
+	# 	cd "$SCRIPT_DIR/NvConfig" && git pull
+	# 	cd "$CWD"
+	# fi
+	# touch "$SCRIPT_DIR/.nvconfig.pull"
+
+	do_config
+}
+
+#
+# Main switch.
+#
+# Only look for font-config stuff when not using SSH or a raw console
+# TODO: Consider OSTYPE = "darwin" or grep -qi microsoft /proc/version
+if [ -z "$SSH_CONNECTION" ] || [ "$XDG_SESSION_TYPE" != "tty" ]; then
+	check_depends docker xauth git unzip curl fc-cache fc-match
+else
+	check_depends docker xauth git unzip curl
+fi
+case "$1" in
+	"--cleanbuild")
+		#rm -f "$SCRIPT_DIR/.ready" "$SCRIPT_DIR/.mirror" "$SCRIPT_DIR/.urls"
+		rm -f "$SCRIPT_DIR/.ready"
+		get_config
+		initialize
+		do_clean
+		BUILD_ARG="--no-cache"
+		do_build
+		do_run
+		;;
+	"--build")
+		get_config
+		initialize
+		do_clean
+		do_build
+		do_run
+		;;
+	"--help")
+		get_config
+		print_usage
+		;;
+	"--mirror")
+		rm -f "$SCRIPT_DIR/.mirror" "$SCRIPT_DIR/.urls"
+		get_config
+		check_mirror
+		;;
+	"--config")
+		get_config
+		print_config
+		;;
+	"--install")
+		get_config
+		initialize
+		do_install
+		;;
+	"--kill")
+		get_config
+		do_kill
+		;;
+	"--killall")
+		get_config
+		do_kill
+		;;
+	"--shell")
+		get_config
+		initialize
+		do_shell
+		;;
+	"--update")
+		get_config
+		do_docker_update
+		do_git_update
+		;;
+	"--nop")
+		get_config
+		;;
+	*)
+		# preserve all command line arguments
+		get_config
+		initialize
+		do_run
+		[ $? -eq 0 ] && do_update_check
+		;;
+esac
